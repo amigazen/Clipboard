@@ -53,7 +53,7 @@ VOID Cleanup(VOID);
 VOID ShowUsage(VOID);
 LONG CopyToClipboard(STRPTR fileName, ULONG unit);
 LONG CopyTextToClipboard(STRPTR fileName, ULONG unit, STRPTR textBuffer, ULONG textLength);
-LONG PasteFromClipboard(STRPTR fileName, ULONG unit);
+LONG PasteFromClipboard(STRPTR fileName, ULONG unit, BOOL forceOverwrite);
 LONG ListClipboards(VOID);
 ULONG FormIDToUnit(ULONG formID);
 LONG FlushClipboard(ULONG unit);
@@ -71,7 +71,8 @@ int main(int argc, char *argv[])
     ULONG unit = 0;
     BOOL listMode = FALSE;
     BOOL flushMode = FALSE;
-    LONG args[5];
+    BOOL forceOverwrite = FALSE;
+    LONG args[6];
     LONG result = RETURN_FAIL;
     
     /* Check if running from CLI */
@@ -91,10 +92,10 @@ int main(int argc, char *argv[])
     }
     
     /* Parse command line arguments */
-    /* Template: COPY/K,PASTE/K,CLIPUNIT/K/N,LIST/S,FLUSH/S */
+    /* Template: COPY/K,PASTE/K,CLIPUNIT/K/N,LIST/S,FLUSH/S,FORCE/S */
     memset(args, 0, sizeof(args));
     
-    rda = ReadArgs("COPY/K,PASTE/K,CLIPUNIT/K/N,LIST/S,FLUSH/S", args, NULL);
+    rda = ReadArgs("FROM=COPY/K,TO=PASTE/K,CLIPUNIT/K/N,LIST/S,FLUSH/S,FORCE/S", args, NULL);
     if (!rda) {
         LONG errorCode = IoErr();
         ShowUsage();
@@ -108,6 +109,7 @@ int main(int argc, char *argv[])
     if (args[2]) unit = *((ULONG *)args[2]);
     if (args[3]) listMode = TRUE;
     if (args[4]) flushMode = TRUE;
+    if (args[5]) forceOverwrite = TRUE;
     
     /* Validate unit number */
     if (unit > 255) {
@@ -154,7 +156,7 @@ int main(int argc, char *argv[])
         
         if (pasteFile) {
             LONG pasteResult;
-            pasteResult = PasteFromClipboard(pasteFile, unit);
+            pasteResult = PasteFromClipboard(pasteFile, unit, forceOverwrite);
             if (pasteResult != RETURN_OK) {
                 result = pasteResult;  /* Use paste result if copy succeeded but paste failed */
             }
@@ -254,6 +256,7 @@ VOID ShowUsage(VOID)
     Printf("  CLIPUNIT=<n>   Clipboard unit number (0-255, default 0)\n");
     Printf("  LIST           List all clipboard units with content (0-255)\n");
     Printf("  FLUSH          Clear the specified clipboard unit\n");
+    Printf("  FORCE          Overwrite existing files when pasting\n");
     Printf("\n");
     Printf("Note: COPY and PASTE can be used together. COPY is always performed first, then PASTE. This can be used to convert files to IFF format.\n");
     Printf("\n");
@@ -297,6 +300,7 @@ LONG CopyToClipboard(STRPTR fileName, ULONG unit)
     struct IFFHandle *iffh;
     struct IFFHandle *readIffh;
     struct ClipboardHandle *clipHandle;
+    UBYTE tempFileName[31];  /* Max 30 chars + null terminator */
     STRPTR tempFile;
     BPTR tempFileHandle;
     LONG bytesRead;
@@ -304,6 +308,7 @@ LONG CopyToClipboard(STRPTR fileName, ULONG unit)
     LONG result = RETURN_FAIL;
     ULONG *methods;
     BOOL supportsWrite = FALSE;
+    ULONG uniqueID;
     
     if (!fileName || *fileName == '\0') {
         PrintFault(ERROR_OBJECT_NOT_FOUND, "Clipboard: No file specified");
@@ -387,8 +392,11 @@ LONG CopyToClipboard(STRPTR fileName, ULONG unit)
         return RETURN_FAIL;
     }
     
-    /* Save object to temporary RAM: file using SaveDTObjectA */
-    tempFile = "RAM:clipboard_temp.iff";
+    /* Generate unique temporary filename using GetUniqueID */
+    /* Format: "T:clipboard_XXXXXXXX.iff" where X is hex unique ID */
+    uniqueID = GetUniqueID();
+    SNPrintf(tempFileName, sizeof(tempFileName), "T:clip%08lX", uniqueID);
+    tempFile = tempFileName;
     
     if (!SaveDTObjectA(dtObject, NULL, NULL, tempFile, DTWM_IFF, FALSE, TAG_END)) {
         LONG errorCode = IoErr();
@@ -408,6 +416,7 @@ LONG CopyToClipboard(STRPTR fileName, ULONG unit)
         if (errorCode == 0) {
             errorCode = ERROR_OBJECT_NOT_FOUND;
         }
+        DeleteFile(tempFile);
         PrintFault(errorCode, "Clipboard: Could not open clipboard");
         return RETURN_FAIL;
     }
@@ -416,6 +425,7 @@ LONG CopyToClipboard(STRPTR fileName, ULONG unit)
     tempFileHandle = Open(tempFile, MODE_OLDFILE);
     if (!tempFileHandle) {
         LONG errorCode = IoErr();
+        DeleteFile(tempFile);
         CloseClipboard(clipHandle);
         PrintFault(errorCode ? errorCode : ERROR_OBJECT_NOT_FOUND, "Clipboard: Could not open temporary file");
         return RETURN_FAIL;
@@ -475,6 +485,10 @@ LONG CopyToClipboard(STRPTR fileName, ULONG unit)
     }
     
     Close(tempFileHandle);
+    
+    /* Delete temporary file */
+    DeleteFile(tempFile);
+    
     CloseClipboard(clipHandle);
     
     return result;
@@ -705,11 +719,24 @@ LONG ExtractTextFromClipboard(STRPTR fileName, ULONG unit)
 }
 
 /* Paste from clipboard to file using datatypes API */
-LONG PasteFromClipboard(STRPTR fileName, ULONG unit)
+/* For text (FTXT), extracts plain ASCII text */
+/* For other types, saves as IFF format using DataTypes */
+LONG PasteFromClipboard(STRPTR fileName, ULONG unit, BOOL forceOverwrite)
 {
-    Object *dtObject = NULL;
-    UBYTE unitStr[4];
+    struct ClipboardHandle *clipHandle = NULL;
+    struct IOClipReq *ioreq = NULL;
+    BPTR outputFile = NULL;
+    BPTR testFile = NULL;
+    UBYTE readBuffer[100];
+    struct {
+        ULONG form;
+        ULONG length;
+        ULONG formtype;
+    } iffHeader;
     LONG result = RETURN_FAIL;
+    LONG chunkRead = 0;
+    LONG bytesToRead = 0;
+    LONG totalWritten = 0;
     BOOL isText = FALSE;
     
     if (!fileName || *fileName == '\0') {
@@ -717,62 +744,189 @@ LONG PasteFromClipboard(STRPTR fileName, ULONG unit)
         return RETURN_FAIL;
     }
     
-    /* Convert unit number to string */
-    SNPrintf(unitStr, sizeof(unitStr), "%lu", unit);
+    /* Check if output file already exists */
+    if (!forceOverwrite) {
+        testFile = Open(fileName, MODE_OLDFILE);
+        if (testFile) {
+            Close(testFile);
+            PrintFault(ERROR_OBJECT_EXISTS, "Clipboard: File already exists (use FORCE to overwrite)");
+            return RETURN_FAIL;
+        }
+    }
     
-    /* Create datatype object from clipboard */
-    /* For clipboard source, name is the unit number as string */
-    /* Don't restrict GroupID - we want to accept any clipboard content type */
-    dtObject = NewDTObject((APTR)unitStr,
-                           DTA_SourceType, DTST_CLIPBOARD,
-                           TAG_END);
-    
-    if (!dtObject) {
+    /* Open clipboard */
+    clipHandle = OpenClipboard(unit);
+    if (!clipHandle) {
         LONG errorCode = IoErr();
         if (errorCode == 0) {
             errorCode = ERROR_OBJECT_NOT_FOUND;
         }
-        PrintFault(errorCode, "Clipboard: Could not create datatype object from clipboard");
+        PrintFault(errorCode, "Clipboard: Could not open clipboard");
         return RETURN_FAIL;
     }
     
-    /* Check if clipboard contains text data */
-    /* Get DTA_DataType to determine type */
-    {
-        struct DataType *dt = NULL;
-        if (GetDTAttrs(dtObject, DTA_DataType, (ULONG)&dt, TAG_END) > 0 && dt) {
-            /* Check GroupID to determine if it's text */
-            if (dt->dtn_Header->dth_GroupID == GID_TEXT) {
-                isText = TRUE;
+    ioreq = &clipHandle->cbh_Req;
+    
+    /* Read FORM header (12 bytes) to check if it's FTXT */
+    ioreq->io_Offset = 0;
+    ioreq->io_ClipID = 0;
+    ioreq->io_Command = CMD_READ;
+    ioreq->io_Length = 12;
+    ioreq->io_Data = (APTR)&iffHeader;
+    DoIO((struct IORequest *)ioreq);
+    
+    if (ioreq->io_Actual >= 8 && 
+        iffHeader.form == ID_FORM && 
+        iffHeader.formtype == MAKE_ID('F','T','X','T')) {
+        /* It's FTXT - extract plain ASCII text */
+        isText = TRUE;
+    }
+    
+    if (isText) {
+        /* Extract plain ASCII text from FTXT/CHRS chunks */
+        /* Open output file */
+        outputFile = Open(fileName, MODE_NEWFILE);
+        if (!outputFile) {
+            LONG errorCode = IoErr();
+            /* Skip to end of clipboard to release it */
+            ioreq->io_Length = ~0L;
+            ioreq->io_Data = NULL;
+            DoIO((struct IORequest *)ioreq);
+            if (ioreq->io_Actual) {
+                DoIO((struct IORequest *)ioreq);
+            }
+            CloseClipboard(clipHandle);
+            PrintFault(errorCode, "Clipboard: Could not open output file");
+            return RETURN_FAIL;
+        }
+        
+        while (TRUE) {
+            /* Read chunk header (8 bytes: type + length) */
+            ioreq->io_Length = 8;
+            ioreq->io_Data = (APTR)&iffHeader;
+            DoIO((struct IORequest *)ioreq);
+            
+            if (!ioreq->io_Actual) {
+                /* End of clipboard */
+                break;
+            }
+            
+            if (iffHeader.form == MAKE_ID('C','H','R','S')) {
+                /* This is the CHRS chunk - read and write the text data */
+                while (iffHeader.length > 0) {
+                    bytesToRead = iffHeader.length;
+                    if (bytesToRead > 100) {
+                        bytesToRead = 100;
+                    }
+                    
+                    ioreq->io_Length = bytesToRead;
+                    ioreq->io_Data = (APTR)readBuffer;
+                    DoIO((struct IORequest *)ioreq);
+                    
+                    chunkRead = ioreq->io_Actual;
+                    if (chunkRead > 0) {
+                        if (Write(outputFile, readBuffer, chunkRead) == -1) {
+                            /* Error writing - skip to end and cleanup */
+                            ioreq->io_Length = ~0L;
+                            ioreq->io_Data = NULL;
+                            DoIO((struct IORequest *)ioreq);
+                            if (ioreq->io_Actual) {
+                                DoIO((struct IORequest *)ioreq);
+                            }
+                            Close(outputFile);
+                            CloseClipboard(clipHandle);
+                            PrintFault(IoErr(), "Clipboard: Error writing file");
+                            return RETURN_FAIL;
+                        }
+                        totalWritten += chunkRead;
+                        iffHeader.length -= chunkRead;
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                /* Not CHRS chunk - skip it */
+                ioreq->io_Length = iffHeader.length;
+                ioreq->io_Data = NULL;
+                DoIO((struct IORequest *)ioreq);
             }
         }
-    }
-    
-    /* For text data, extract plain text from FTXT/CHRS */
-    if (isText) {
-        DisposeDTObject(dtObject);
-        return ExtractTextFromClipboard(fileName, unit);
-    }
-    
-    /* For non-text data, use SaveDTObjectA to save as IFF */
-    /* SaveDTObjectA uses DTM_WRITE internally */
-    result = SaveDTObjectA(dtObject, NULL, NULL, fileName, DTWM_IFF, FALSE, TAG_END);
-    
-    if (result) {
-        /* Success */
+        
+        Close(outputFile);
+        CloseClipboard(clipHandle);
         result = RETURN_OK;
     } else {
-        /* Failure - check IoErr() for more details */
-        LONG errorCode = IoErr();
-        if (errorCode == 0) {
-            errorCode = ERROR_WRITE_PROTECTED;
+        /* Not text - use datatypes API to save as IFF */
+        struct IFFHandle *iffh = NULL;
+        Object *dtObject = NULL;
+        
+        /* Reset clipboard position */
+        ioreq->io_Offset = 0;
+        ioreq->io_ClipID = 0;
+        
+        /* Skip to end to release clipboard for IFF parsing */
+        ioreq->io_Length = ~0L;
+        ioreq->io_Data = NULL;
+        DoIO((struct IORequest *)ioreq);
+        if (ioreq->io_Actual) {
+            DoIO((struct IORequest *)ioreq);
         }
-        PrintFault(errorCode, "Clipboard: Failed to paste from clipboard");
-        result = RETURN_FAIL;
+        
+        /* Allocate IFF handle */
+        iffh = AllocIFF();
+        if (!iffh) {
+            PrintFault(ERROR_NO_FREE_STORE, "Clipboard: Could not allocate IFF handle");
+            CloseClipboard(clipHandle);
+            return RETURN_FAIL;
+        }
+        
+        /* Initialize IFF for clipboard reading */
+        InitIFFasClip(iffh);
+        iffh->iff_Stream = (ULONG)clipHandle;
+        
+        /* Open IFF for reading */
+        if (OpenIFF(iffh, IFFF_READ)) {
+            PrintFault(ERROR_OBJECT_NOT_FOUND, "Clipboard: Could not open clipboard for reading");
+            FreeIFF(iffh);
+            CloseClipboard(clipHandle);
+            return RETURN_FAIL;
+        }
+        
+        /* Create datatype object from clipboard using IFFHandle */
+        dtObject = NewDTObject(NULL,
+                               DTA_SourceType, DTST_CLIPBOARD,
+                               DTA_Handle, (ULONG)iffh,
+                               TAG_END);
+        
+        if (!dtObject) {
+            LONG errorCode = IoErr();
+            if (errorCode == 0) {
+                errorCode = ERROR_OBJECT_NOT_FOUND;
+            }
+            PrintFault(errorCode, "Clipboard: Could not create datatype object from clipboard");
+            CloseIFF(iffh);
+            FreeIFF(iffh);
+            CloseClipboard(clipHandle);
+            return RETURN_FAIL;
+        }
+        
+        /* Use SaveDTObjectA to save clipboard content to file as IFF */
+        result = SaveDTObjectA(dtObject, NULL, NULL, fileName, DTWM_IFF, FALSE, TAG_END);
+        
+        if (result) {
+            result = RETURN_OK;
+        } else {
+            LONG errorCode = IoErr();
+            if (errorCode == 0) {
+                errorCode = ERROR_WRITE_PROTECTED;
+            }
+            PrintFault(errorCode, "Clipboard: Failed to paste from clipboard");
+            result = RETURN_FAIL;
+        }
+        
+        /* Dispose of the datatype object - it will cleanup IFF and clipboard handles */
+        DisposeDTObject(dtObject);
     }
-    
-    /* Dispose of the datatype object */
-    DisposeDTObject(dtObject);
     
     return result;
 }
