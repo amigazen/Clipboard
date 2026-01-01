@@ -1,0 +1,45 @@
+# SMakefile for Clipboard
+# 
+# Clipboard - Universal clipboard and file converter using datatypes API
+#
+
+# Program name
+PROGRAM = Clipboard
+
+# Source files
+SRCS = clipboard.c
+
+# Object files
+OBJS = clipboard.o
+
+# Compiler and linker
+CC = sc
+LINK = slink
+
+# Default target
+all: $(PROGRAM)
+
+# Create the Clipboard executable
+$(PROGRAM): $(OBJS)
+	$(LINK) FROM sc:lib/c.o $(OBJS) TO $(PROGRAM) STRIPDEBUG NODEBUG LIB lib:small.lib sc:lib/sc.lib BATCH
+
+# Compile the source files
+.c.o:
+	$(CC) $*.c OBJNAME=$*.o IDIR=include:
+
+# Compile Clipboard files
+clipboard.o: clipboard.c
+	$(CC) clipboard.c OBJNAME=clipboard.o IDIR=include:
+
+# Clean target
+clean:
+	Delete $(OBJS) $(PROGRAM) clipboard.o
+
+# Install target
+install:
+	@echo "Installing Clipboard to SDK/C..."
+	@copy $(PROGRAM) to /SDK/C/$(PROGRAM) CLONE
+
+# Dependencies
+clipboard.o: clipboard.c
+
