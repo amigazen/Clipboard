@@ -57,8 +57,9 @@ LONG PasteFromClipboard(STRPTR fileName, ULONG unit, BOOL forceOverwrite);
 LONG ListClipboards(VOID);
 ULONG FormIDToUnit(ULONG formID);
 LONG FlushClipboard(ULONG unit);
+VOID CBReadDone(struct IOClipReq *ioreq);
 
-static const char *verstag = "$VER: Clipboard 1.1 (1.1.2026)\n";
+static const char *verstag = "$VER: Clipboard 1.2 (2.1.2026)\n";
 static const char *stack_cookie = "$STACK: 4096\n";
 const long oslibversion = 45L;
 
@@ -450,16 +451,18 @@ LONG CopyToClipboard(STRPTR fileName, ULONG unit)
                     
                     ioreq->io_Offset = 0;
                     ioreq->io_ClipID = 0;
+                    ioreq->io_Error = 0;
                     ioreq->io_Command = CMD_WRITE;
                     ioreq->io_Data = fileBuffer;
                     ioreq->io_Length = fileSize;
                     
                     DoIO((struct IORequest *)ioreq);
                     
-                    if (ioreq->io_Error == 0) {
+                    if (ioreq->io_Error == 0 && ioreq->io_Actual == fileSize) {
                         /* Send CMD_UPDATE to finalize */
                         ioreq->io_Command = CMD_UPDATE;
                         ioreq->io_ClipID = ioreq->io_ClipID;  /* Use the ClipID from write */
+                        ioreq->io_Error = 0;
                         DoIO((struct IORequest *)ioreq);
                         
                         if (ioreq->io_Error == 0) {
@@ -468,7 +471,11 @@ LONG CopyToClipboard(STRPTR fileName, ULONG unit)
                             PrintFault(ioreq->io_Error, "Clipboard: Could not update clipboard");
                         }
                     } else {
-                        PrintFault(ioreq->io_Error, "Clipboard: Could not write to clipboard");
+                        LONG errorCode = ioreq->io_Error;
+                        if (errorCode == 0) {
+                            errorCode = ERROR_WRITE_PROTECTED;
+                        }
+                        PrintFault(errorCode, "Clipboard: Could not write to clipboard");
                     }
                 } else {
                     LONG errorCode = IoErr();
@@ -494,21 +501,45 @@ LONG CopyToClipboard(STRPTR fileName, ULONG unit)
     return result;
 }
 
+/* Signal to clipboard that we are done reading */
+/* This drains the clipboard by reading until io_Actual is zero */
+VOID CBReadDone(struct IOClipReq *ioreq)
+{
+    UBYTE buffer[256];
+    
+    if (!ioreq) {
+        return;
+    }
+    
+    ioreq->io_Command = CMD_READ;
+    ioreq->io_Data = (STRPTR)buffer;
+    ioreq->io_Length = 254;
+    
+    while (TRUE) {
+        DoIO((struct IORequest *)ioreq);
+        if (ioreq->io_Actual == 0 || ioreq->io_Error != 0) {
+            break;
+        }
+    }
+}
+
 /* Copy text directly to clipboard using FTXT format */
+/* Uses IFFParse library functions for proper IFF structure handling and padding */
 LONG CopyTextToClipboard(STRPTR fileName, ULONG unit, STRPTR textBuffer, ULONG textLength)
 {
+    struct IFFHandle *iffh = NULL;
     struct ClipboardHandle *clipHandle = NULL;
-    struct IOClipReq *ioreq = NULL;
-    ULONG formLength = 0;
-    ULONG chunkLength = 0;
-    UBYTE writeBuffer[100];
-    ULONG bytesToWrite = 0;
-    ULONG bytesWritten = 0;
     LONG result = RETURN_FAIL;
-    ULONG i = 0;
+    LONG error = 0;
     
     if (!textBuffer || textLength == 0) {
         PrintFault(ERROR_OBJECT_NOT_FOUND, "Clipboard: No text data to copy");
+        return RETURN_FAIL;
+    }
+    
+    /* Allocate IFF handle */
+    if (!(iffh = AllocIFF())) {
+        PrintFault(ERROR_NO_FREE_STORE, "Clipboard: Could not allocate IFF handle");
         return RETURN_FAIL;
     }
     
@@ -520,75 +551,88 @@ LONG CopyTextToClipboard(STRPTR fileName, ULONG unit, STRPTR textBuffer, ULONG t
             errorCode = ERROR_OBJECT_NOT_FOUND;
         }
         PrintFault(errorCode, "Clipboard: Could not open clipboard");
+        FreeIFF(iffh);
         return RETURN_FAIL;
     }
     
-    ioreq = &clipHandle->cbh_Req;
+    /* Initialize IFF for clipboard writing */
+    InitIFFasClip(iffh);
+    iffh->iff_Stream = (ULONG)clipHandle;
     
-    /* FORM chunk contains: FTXT (4) + CHRS (4) + length (4) + data (length) = 12 + length */
-    formLength = textLength + 12;
-    
-    ioreq->io_Offset = 0;
-    ioreq->io_ClipID = 0;
-    ioreq->io_Command = CMD_WRITE;
-    ioreq->io_Length = 4;
-    
-    /* Write "FORM" (4 bytes) */
-    ioreq->io_Data = (APTR)"FORM";
-    DoIO((struct IORequest *)ioreq);
-    
-    /* Write form length (4 bytes) */
-    ioreq->io_Data = (APTR)&formLength;
-    DoIO((struct IORequest *)ioreq);
-    
-    /* Write "FTXT" (4 bytes) */
-    ioreq->io_Data = (APTR)"FTXT";
-    DoIO((struct IORequest *)ioreq);
-    
-    /* Write "CHRS" (4 bytes) */
-    ioreq->io_Data = (APTR)"CHRS";
-    DoIO((struct IORequest *)ioreq);
-    
-    /* Write text length (4 bytes) - use textLength directly */
-    ioreq->io_Data = (APTR)&textLength;
-    DoIO((struct IORequest *)ioreq);
-    
-    /* Write text data in chunks */
-    bytesWritten = 0;
-    while (bytesWritten < textLength) {
-        bytesToWrite = textLength - bytesWritten;
-        if (bytesToWrite > 100) {
-            bytesToWrite = 100;
-        }
-        
-        /* Copy chunk to buffer */
-        for (i = 0; i < bytesToWrite; i++) {
-            writeBuffer[i] = textBuffer[bytesWritten + i];
-        }
-        
-        ioreq->io_Length = bytesToWrite;
-        ioreq->io_Data = (APTR)writeBuffer;
-        DoIO((struct IORequest *)ioreq);
-        
-        bytesWritten += bytesToWrite;
+    /* Open IFF for writing */
+    if ((error = OpenIFF(iffh, IFFF_WRITE))) {
+        PrintFault(error, "Clipboard: Could not open clipboard for writing");
+        CloseClipboard(clipHandle);
+        FreeIFF(iffh);
+        return RETURN_FAIL;
     }
     
-    /* Send CMD_UPDATE to finalize */
-    ioreq->io_Command = CMD_UPDATE;
-    ioreq->io_ClipID = ioreq->io_ClipID;  /* Use the ClipID from write */
-    DoIO((struct IORequest *)ioreq);
-    
-    if (ioreq->io_Error == 0) {
-        result = RETURN_OK;
-    } else {
-        PrintFault(ioreq->io_Error, "Clipboard: Could not update clipboard");
+    /* Push FORM FTXT chunk */
+    if ((error = PushChunk(iffh, ID_FTXT, ID_FORM, IFFSIZE_UNKNOWN))) {
+        PrintFault(error, "Clipboard: Could not create FORM FTXT");
+        CloseIFF(iffh);
+        CloseClipboard(clipHandle);
+        FreeIFF(iffh);
+        return RETURN_FAIL;
     }
     
+    /* Push CHRS chunk - IFFParse will handle padding automatically */
+    if ((error = PushChunk(iffh, 0, ID_CHRS, textLength))) {
+        PrintFault(error, "Clipboard: Could not create CHRS chunk");
+        PopChunk(iffh);
+        CloseIFF(iffh);
+        CloseClipboard(clipHandle);
+        FreeIFF(iffh);
+        return RETURN_FAIL;
+    }
+    
+    /* Write text data - IFFParse handles padding automatically for odd-length chunks */
+    if (WriteChunkBytes(iffh, textBuffer, textLength) != textLength) {
+        error = IoErr();
+        if (error == 0) {
+            error = IFFERR_WRITE;
+        }
+        PrintFault(error, "Clipboard: Could not write text data");
+        PopChunk(iffh);
+        PopChunk(iffh);
+        CloseIFF(iffh);
+        CloseClipboard(clipHandle);
+        FreeIFF(iffh);
+        return RETURN_FAIL;
+    }
+    
+    /* Pop CHRS chunk */
+    if ((error = PopChunk(iffh))) {
+        PrintFault(error, "Clipboard: Error closing CHRS chunk");
+        PopChunk(iffh);
+        CloseIFF(iffh);
+        CloseClipboard(clipHandle);
+        FreeIFF(iffh);
+        return RETURN_FAIL;
+    }
+    
+    /* Pop FORM chunk */
+    if ((error = PopChunk(iffh))) {
+        PrintFault(error, "Clipboard: Error closing FORM chunk");
+        CloseIFF(iffh);
+        CloseClipboard(clipHandle);
+        FreeIFF(iffh);
+        return RETURN_FAIL;
+    }
+    
+    /* Close IFF - this sends CMD_UPDATE automatically */
+    CloseIFF(iffh);
+    
+    /* Cleanup */
     CloseClipboard(clipHandle);
+    FreeIFF(iffh);
+    
+    result = RETURN_OK;
     return result;
 }
 
 /* Extract text from FTXT/CHRS chunks and write to file */
+/* Handles multiple CHRS chunks properly */
 LONG ExtractTextFromClipboard(STRPTR fileName, ULONG unit)
 {
     struct IFFHandle *iffh = NULL;
@@ -599,6 +643,7 @@ LONG ExtractTextFromClipboard(STRPTR fileName, ULONG unit)
     ULONG bufferSize = 4096;
     LONG len = 0;
     LONG result = RETURN_FAIL;
+    LONG error = 0;
     
     /* Allocate IFF handle */
     if (!(iffh = AllocIFF())) {
@@ -618,64 +663,16 @@ LONG ExtractTextFromClipboard(STRPTR fileName, ULONG unit)
     iffh->iff_Stream = (ULONG)clipHandle;
     
     /* Open IFF for reading */
-    if (OpenIFF(iffh, IFFF_READ)) {
-        PrintFault(ERROR_OBJECT_NOT_FOUND, "Clipboard: Could not open clipboard for reading");
+    if ((error = OpenIFF(iffh, IFFF_READ))) {
+        PrintFault(error, "Clipboard: Could not open clipboard for reading");
         CloseClipboard(clipHandle);
         FreeIFF(iffh);
         return RETURN_FAIL;
     }
     
     /* Stop on FTXT/CHRS chunks */
-    if (StopChunk(iffh, ID_FTXT, ID_CHRS)) {
-        PrintFault(ERROR_OBJECT_WRONG_TYPE, "Clipboard: Could not register IFF chunk");
-        CloseIFF(iffh);
-        CloseClipboard(clipHandle);
-        FreeIFF(iffh);
-        return RETURN_FAIL;
-    }
-    
-    /* Parse IFF to find CHRS chunk */
-    if (ParseIFF(iffh, IFFPARSE_SCAN)) {
-        PrintFault(ERROR_OBJECT_NOT_FOUND, "Clipboard: Clipboard is empty or contains invalid data");
-        CloseIFF(iffh);
-        CloseClipboard(clipHandle);
-        FreeIFF(iffh);
-        return RETURN_FAIL;
-    }
-    
-    /* Get current chunk */
-    if (!(cn = CurrentChunk(iffh))) {
-        PrintFault(ERROR_OBJECT_WRONG_TYPE, "Clipboard: Clipboard contains invalid data");
-        CloseIFF(iffh);
-        CloseClipboard(clipHandle);
-        FreeIFF(iffh);
-        return RETURN_FAIL;
-    }
-    
-    /* Check if it's a FTXT/CHRS chunk */
-    if (cn->cn_Type != ID_FTXT || cn->cn_ID != ID_CHRS) {
-        PrintFault(ERROR_OBJECT_WRONG_TYPE, "Clipboard: Clipboard does not contain text data");
-        CloseIFF(iffh);
-        CloseClipboard(clipHandle);
-        FreeIFF(iffh);
-        return RETURN_FAIL;
-    }
-    
-    /* Allocate buffer for reading */
-    bufferSize = cn->cn_Size + 1;
-    if (!(buffer = AllocMem(bufferSize, MEMF_ANY | MEMF_CLEAR))) {
-        PrintFault(ERROR_NO_FREE_STORE, "Clipboard: Could not allocate memory");
-        CloseIFF(iffh);
-        CloseClipboard(clipHandle);
-        FreeIFF(iffh);
-        return RETURN_FAIL;
-    }
-    
-    /* Read CHRS chunk data */
-    len = ReadChunkBytes(iffh, buffer, cn->cn_Size);
-    if (len < 0) {
-        PrintFault(ERROR_READ_PROTECTED, "Clipboard: Could not read clipboard data");
-        FreeMem(buffer, bufferSize);
+    if ((error = StopChunk(iffh, ID_FTXT, ID_CHRS))) {
+        PrintFault(error, "Clipboard: Could not register IFF chunk");
         CloseIFF(iffh);
         CloseClipboard(clipHandle);
         FreeIFF(iffh);
@@ -686,11 +683,11 @@ LONG ExtractTextFromClipboard(STRPTR fileName, ULONG unit)
     if (fileName && *fileName != '\0') {
         outputFile = Open(fileName, MODE_NEWFILE);
         if (!outputFile) {
-            PrintFault(IoErr(), "Clipboard: Could not open output file");
-            FreeMem(buffer, bufferSize);
+            LONG errorCode = IoErr();
             CloseIFF(iffh);
             CloseClipboard(clipHandle);
             FreeIFF(iffh);
+            PrintFault(errorCode, "Clipboard: Could not open output file");
             return RETURN_FAIL;
         }
     } else {
@@ -698,19 +695,61 @@ LONG ExtractTextFromClipboard(STRPTR fileName, ULONG unit)
         outputFile = Output();
     }
     
-    /* Write text to file */
-    if (Write(outputFile, buffer, len) != len) {
-        PrintFault(IoErr(), "Clipboard: Could not write to file");
-        result = RETURN_FAIL;
-    } else {
-        result = RETURN_OK;
+    /* Allocate buffer for reading */
+    if (!(buffer = AllocMem(bufferSize, MEMF_ANY))) {
+        PrintFault(ERROR_NO_FREE_STORE, "Clipboard: Could not allocate memory");
+        if (outputFile && outputFile != Output()) {
+            Close(outputFile);
+        }
+        CloseIFF(iffh);
+        CloseClipboard(clipHandle);
+        FreeIFF(iffh);
+        return RETURN_FAIL;
+    }
+    
+    /* Parse IFF and extract all CHRS chunks */
+    while (TRUE) {
+        error = ParseIFF(iffh, IFFPARSE_SCAN);
+        
+        if (error == IFFERR_EOC) {
+            /* End of context, continue to next */
+            continue;
+        } else if (error) {
+            /* Error or end of file */
+            if (error != IFFERR_EOF) {
+                PrintFault(error, "Clipboard: Error parsing clipboard");
+                result = RETURN_FAIL;
+            } else {
+                result = RETURN_OK;
+            }
+            break;
+        }
+        
+        /* Get current chunk */
+        cn = CurrentChunk(iffh);
+        if (cn && cn->cn_Type == ID_FTXT && cn->cn_ID == ID_CHRS) {
+            /* Read CHRS chunk data in chunks */
+            while ((len = ReadChunkBytes(iffh, buffer, bufferSize)) > 0) {
+                if (Write(outputFile, buffer, len) != len) {
+                    PrintFault(IoErr(), "Clipboard: Could not write to file");
+                    result = RETURN_FAIL;
+                    break;
+                }
+            }
+            
+            if (len < 0) {
+                PrintFault(len, "Clipboard: Error reading chunk");
+                result = RETURN_FAIL;
+                break;
+            }
+        }
     }
     
     /* Cleanup */
+    FreeMem(buffer, bufferSize);
     if (outputFile && outputFile != Output()) {
         Close(outputFile);
     }
-    FreeMem(buffer, bufferSize);
     CloseIFF(iffh);
     CloseClipboard(clipHandle);
     FreeIFF(iffh);
@@ -727,15 +766,12 @@ LONG PasteFromClipboard(STRPTR fileName, ULONG unit, BOOL forceOverwrite)
     struct IOClipReq *ioreq = NULL;
     BPTR outputFile = NULL;
     BPTR testFile = NULL;
-    UBYTE readBuffer[100];
     struct {
         ULONG form;
         ULONG length;
         ULONG formtype;
     } iffHeader;
     LONG result = RETURN_FAIL;
-    LONG chunkRead = 0;
-    LONG bytesToRead = 0;
     LONG totalWritten = 0;
     BOOL isText = FALSE;
     
@@ -783,94 +819,120 @@ LONG PasteFromClipboard(STRPTR fileName, ULONG unit, BOOL forceOverwrite)
     }
     
     if (isText) {
-        /* Extract plain ASCII text from FTXT/CHRS chunks */
+        /* Use IFFParse to extract text from FTXT/CHRS chunks */
+        struct IFFHandle *iffh = NULL;
+        struct ContextNode *cn = NULL;
+        UBYTE *readBuffer = NULL;
+        LONG bufferSize = 4096;
+        LONG bytesRead = 0;
+        LONG error = 0;
+        
+        /* Drain clipboard to release it for IFF parsing */
+        CBReadDone(ioreq);
+        
+        /* Allocate IFF handle */
+        iffh = AllocIFF();
+        if (!iffh) {
+            PrintFault(ERROR_NO_FREE_STORE, "Clipboard: Could not allocate IFF handle");
+            CloseClipboard(clipHandle);
+            return RETURN_FAIL;
+        }
+        
+        /* Initialize IFF for clipboard reading */
+        InitIFFasClip(iffh);
+        iffh->iff_Stream = (ULONG)clipHandle;
+        
+        /* Open IFF for reading */
+        if ((error = OpenIFF(iffh, IFFF_READ))) {
+            PrintFault(error, "Clipboard: Could not open clipboard for reading");
+            FreeIFF(iffh);
+            CloseClipboard(clipHandle);
+            return RETURN_FAIL;
+        }
+        
+        /* Stop on FTXT/CHRS chunks */
+        if ((error = StopChunk(iffh, ID_FTXT, ID_CHRS))) {
+            PrintFault(error, "Clipboard: Could not register IFF chunk");
+            CloseIFF(iffh);
+            FreeIFF(iffh);
+            CloseClipboard(clipHandle);
+            return RETURN_FAIL;
+        }
+        
         /* Open output file */
         outputFile = Open(fileName, MODE_NEWFILE);
         if (!outputFile) {
             LONG errorCode = IoErr();
-            /* Skip to end of clipboard to release it */
-            ioreq->io_Length = ~0L;
-            ioreq->io_Data = NULL;
-            DoIO((struct IORequest *)ioreq);
-            if (ioreq->io_Actual) {
-                DoIO((struct IORequest *)ioreq);
-            }
+            CloseIFF(iffh);
+            FreeIFF(iffh);
             CloseClipboard(clipHandle);
             PrintFault(errorCode, "Clipboard: Could not open output file");
             return RETURN_FAIL;
         }
         
+        /* Allocate buffer for reading */
+        readBuffer = AllocMem(bufferSize, MEMF_ANY);
+        if (!readBuffer) {
+            PrintFault(ERROR_NO_FREE_STORE, "Clipboard: Could not allocate buffer");
+            Close(outputFile);
+            CloseIFF(iffh);
+            FreeIFF(iffh);
+            CloseClipboard(clipHandle);
+            return RETURN_FAIL;
+        }
+        
+        /* Parse IFF and extract all CHRS chunks */
         while (TRUE) {
-            /* Read chunk header (8 bytes: type + length) */
-            ioreq->io_Length = 8;
-            ioreq->io_Data = (APTR)&iffHeader;
-            DoIO((struct IORequest *)ioreq);
+            error = ParseIFF(iffh, IFFPARSE_SCAN);
             
-            if (!ioreq->io_Actual) {
-                /* End of clipboard */
+            if (error == IFFERR_EOC) {
+                /* End of context, continue to next */
+                continue;
+            } else if (error) {
+                /* Error or end of file */
+                if (error != IFFERR_EOF) {
+                    PrintFault(error, "Clipboard: Error parsing clipboard");
+                    result = RETURN_FAIL;
+                } else {
+                    result = RETURN_OK;
+                }
                 break;
             }
             
-            if (iffHeader.form == MAKE_ID('C','H','R','S')) {
-                /* This is the CHRS chunk - read and write the text data */
-                while (iffHeader.length > 0) {
-                    bytesToRead = iffHeader.length;
-                    if (bytesToRead > 100) {
-                        bytesToRead = 100;
-                    }
-                    
-                    ioreq->io_Length = bytesToRead;
-                    ioreq->io_Data = (APTR)readBuffer;
-                    DoIO((struct IORequest *)ioreq);
-                    
-                    chunkRead = ioreq->io_Actual;
-                    if (chunkRead > 0) {
-                        if (Write(outputFile, readBuffer, chunkRead) == -1) {
-                            /* Error writing - skip to end and cleanup */
-                            ioreq->io_Length = ~0L;
-                            ioreq->io_Data = NULL;
-                            DoIO((struct IORequest *)ioreq);
-                            if (ioreq->io_Actual) {
-                                DoIO((struct IORequest *)ioreq);
-                            }
-                            Close(outputFile);
-                            CloseClipboard(clipHandle);
-                            PrintFault(IoErr(), "Clipboard: Error writing file");
-                            return RETURN_FAIL;
-                        }
-                        totalWritten += chunkRead;
-                        iffHeader.length -= chunkRead;
-                    } else {
+            /* Get current chunk */
+            cn = CurrentChunk(iffh);
+            if (cn && cn->cn_Type == ID_FTXT && cn->cn_ID == ID_CHRS) {
+                /* Read CHRS chunk data */
+                while ((bytesRead = ReadChunkBytes(iffh, readBuffer, bufferSize)) > 0) {
+                    if (Write(outputFile, readBuffer, bytesRead) != bytesRead) {
+                        PrintFault(IoErr(), "Clipboard: Error writing file");
+                        result = RETURN_FAIL;
                         break;
                     }
+                    totalWritten += bytesRead;
                 }
-            } else {
-                /* Not CHRS chunk - skip it */
-                ioreq->io_Length = iffHeader.length;
-                ioreq->io_Data = NULL;
-                DoIO((struct IORequest *)ioreq);
+                
+                if (bytesRead < 0) {
+                    PrintFault(bytesRead, "Clipboard: Error reading chunk");
+                    result = RETURN_FAIL;
+                    break;
+                }
             }
         }
         
+        /* Cleanup */
+        FreeMem(readBuffer, bufferSize);
         Close(outputFile);
+        CloseIFF(iffh);
+        FreeIFF(iffh);
         CloseClipboard(clipHandle);
-        result = RETURN_OK;
     } else {
         /* Not text - use datatypes API to save as IFF */
         struct IFFHandle *iffh = NULL;
         Object *dtObject = NULL;
         
-        /* Reset clipboard position */
-        ioreq->io_Offset = 0;
-        ioreq->io_ClipID = 0;
-        
-        /* Skip to end to release clipboard for IFF parsing */
-        ioreq->io_Length = ~0L;
-        ioreq->io_Data = NULL;
-        DoIO((struct IORequest *)ioreq);
-        if (ioreq->io_Actual) {
-            DoIO((struct IORequest *)ioreq);
-        }
+        /* Drain clipboard to release it for IFF parsing */
+        CBReadDone(ioreq);
         
         /* Allocate IFF handle */
         iffh = AllocIFF();
@@ -1069,32 +1131,10 @@ LONG ListClipboards(VOID)
                 }
                 
                 /* Tell clipboard we are done reading */
-                {
-                    UBYTE buffer[256];
-                    ioreq->io_Command = CMD_READ;
-                    ioreq->io_Data = (STRPTR)buffer;
-                    ioreq->io_Length = 254;
-                    while (ioreq->io_Actual) {
-                        DoIO((struct IORequest *)ioreq);
-                        if (ioreq->io_Error != 0) {
-                            break;
-                        }
-                    }
-                }
+                CBReadDone(ioreq);
             } else {
                 /* Not FORM - tell clipboard we are done reading */
-                {
-                    UBYTE buffer[256];
-                    ioreq->io_Command = CMD_READ;
-                    ioreq->io_Data = (STRPTR)buffer;
-                    ioreq->io_Length = 254;
-                    while (ioreq->io_Actual) {
-                        DoIO((struct IORequest *)ioreq);
-                        if (ioreq->io_Error != 0) {
-                            break;
-                        }
-                    }
-                }
+                CBReadDone(ioreq);
             }
         }
         

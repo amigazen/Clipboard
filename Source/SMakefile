@@ -37,7 +37,7 @@ clean:
 
 # Install target
 install:
-	@echo "Installing Clipboard to SDK/C..."
+	@echo "Installing Clipboard to /SDK/C..."
 	@copy $(PROGRAM) to /SDK/C/$(PROGRAM) CLONE
 
 # Dependencies
