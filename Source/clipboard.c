@@ -38,6 +38,8 @@
 #define ID_FTXT MAKE_ID('F','T','X','T')
 #define ID_CHRS MAKE_ID('C','H','R','S')
 #define ID_FORM MAKE_ID('F','O','R','M')
+#define ID_NAME MAKE_ID('N','A','M','E')
+#define ID_TEXT MAKE_ID('T','E','X','T')
 
 /* Library base pointers */
 extern struct ExecBase *SysBase;
@@ -59,7 +61,7 @@ ULONG FormIDToUnit(ULONG formID);
 LONG FlushClipboard(ULONG unit);
 VOID CBReadDone(struct IOClipReq *ioreq);
 
-static const char *verstag = "$VER: Clipboard 1.2 (2.1.2026)\n";
+static const char *verstag = "$VER: Clipboard 1.2 (2/1/2026)\n";
 static const char *stack_cookie = "$STACK: 4096\n";
 const long oslibversion = 45L;
 
@@ -1026,9 +1028,8 @@ LONG ListClipboards(VOID)
     ULONG unitsWithContent = 0;
     LONG result = RETURN_OK;
     
-    Printf("Current clipboard contents:\n");
-    Printf("Unit  Type    Size    Preview (FTXT only)\n");
-    Printf("----  ----    ----    -------------------\n");
+    Printf("Unit  Type    Size     Text Preview\n");
+    Printf("----  ----    ------   ------------\n");
     
     for (unit = 0; unit <= 255; unit++) {
         struct ClipboardHandle *clipHandle = NULL;
@@ -1074,60 +1075,90 @@ LONG ListClipboards(VOID)
                 formSize = cbuff[1];  /* Size of FORM chunk */
                 hasContent = TRUE;
                 
-                /* If it's FTXT, try to get text preview using iffparse */
-                if (formType == ID_FTXT) {
-                    /* Allocate IFF handle for reading CHRS chunk */
-                    iffh = AllocIFF();
-                    if (iffh) {
-                        InitIFFasClip(iffh);
-                        iffh->iff_Stream = (ULONG)clipHandle;
+                /* Try to get text preview from any text chunk (CHRS, NAME, TEXT) */
+                /* Search for text chunks in all IFF types, not just FTXT */
+                iffh = AllocIFF();
+                if (iffh) {
+                    LONG parseError;
+                    BOOL foundText = FALSE;
+                    
+                    InitIFFasClip(iffh);
+                    iffh->iff_Stream = (ULONG)clipHandle;
+                    
+                    if (OpenIFF(iffh, IFFF_READ) == 0) {
+                        /* Step through all chunks to find text chunks */
+                        /* Use IFFPARSE_STEP to examine every chunk, including nested contexts */
+                        /* This ensures we find CHRS, NAME, or TEXT chunks regardless of FORM type */
                         
-                        if (OpenIFF(iffh, IFFF_READ) == 0) {
-                            /* Stop on FTXT/CHRS chunks */
-                            if (StopChunk(iffh, ID_FTXT, ID_CHRS) == 0) {
-                                /* Parse to find CHRS chunk */
-                                if (ParseIFF(iffh, IFFPARSE_SCAN) == 0) {
-                                    cn = CurrentChunk(iffh);
-                                    if (cn && cn->cn_Type == ID_FTXT && cn->cn_ID == ID_CHRS) {
-                                        /* Read up to 40 characters for preview */
-                                        LONG previewSize = cn->cn_Size;
-                                        if (previewSize > 40) {
-                                            previewSize = 40;
-                                        }
-                                        
-                                        if (previewSize > 0) {
-                                            previewAllocSize = previewSize + 1;
-                                            textPreview = AllocMem(previewAllocSize, MEMF_ANY | MEMF_CLEAR);
-                                            if (textPreview) {
-                                                textLen = ReadChunkBytes(iffh, textPreview, previewSize);
-                                                if (textLen > 0) {
-                                                    /* Ensure null termination */
-                                                    textPreview[textLen] = '\0';
-                                                    /* Replace non-printable characters */
-                                                    for (i = 0; i < textLen; i++) {
-                                                        if (textPreview[i] < 32 || textPreview[i] >= 127) {
-                                                            if (textPreview[i] == '\n' || textPreview[i] == '\r' || textPreview[i] == '\t') {
-                                                                textPreview[i] = ' ';
-                                                            } else {
-                                                                textPreview[i] = '.';
-                                                            }
+                        while (!foundText) {
+                            parseError = ParseIFF(iffh, IFFPARSE_STEP);
+                            
+                            if (parseError == IFFERR_EOC) {
+                                /* End of context, continue to next context */
+                                continue;
+                            } else if (parseError != 0) {
+                                /* Error or end of file */
+                                if (parseError != IFFERR_EOF) {
+                                    /* Real error, but continue trying */
+                                }
+                                break;
+                            }
+                            
+                            cn = CurrentChunk(iffh);
+                            if (cn) {
+                                /* Check if it's a text chunk we're looking for */
+                                /* Check chunk ID regardless of FORM type or context */
+                                if (cn->cn_ID == ID_CHRS || 
+                                    cn->cn_ID == ID_NAME || 
+                                    cn->cn_ID == ID_TEXT) {
+                                    /* Found a text chunk - read up to 30 characters */
+                                    LONG previewSize = cn->cn_Size;
+                                    if (previewSize > 30) {
+                                        previewSize = 30;
+                                    }
+                                    
+                                    if (previewSize > 0) {
+                                        previewAllocSize = previewSize + 1;
+                                        textPreview = AllocMem(previewAllocSize, MEMF_ANY | MEMF_CLEAR);
+                                        if (textPreview) {
+                                            textLen = ReadChunkBytes(iffh, textPreview, previewSize);
+                                            if (textLen > 0) {
+                                                /* Ensure null termination */
+                                                textPreview[textLen] = '\0';
+                                                /* Replace non-printable characters */
+                                                for (i = 0; i < textLen; i++) {
+                                                    if (textPreview[i] < 32 || textPreview[i] >= 127) {
+                                                        if (textPreview[i] == '\n' || textPreview[i] == '\r' || textPreview[i] == '\t') {
+                                                            textPreview[i] = ' ';
+                                                        } else {
+                                                            textPreview[i] = '.';
                                                         }
                                                     }
-                                                } else {
-                                                    FreeMem(textPreview, previewAllocSize);
-                                                    textPreview = NULL;
-                                                    previewAllocSize = 0;
                                                 }
+                                                /* Truncate at 30 chars and add ellipsis if needed */
+                                                if (cn->cn_Size > 30 && textLen == 30) {
+                                                    /* Replace last 3 chars with ellipsis */
+                                                    textPreview[27] = '.';
+                                                    textPreview[28] = '.';
+                                                    textPreview[29] = '.';
+                                                    textPreview[30] = '\0';
+                                                    textLen = 30;
+                                                }
+                                                foundText = TRUE;
+                                            } else {
+                                                FreeMem(textPreview, previewAllocSize);
+                                                textPreview = NULL;
+                                                previewAllocSize = 0;
                                             }
                                         }
                                     }
                                 }
                             }
-                            CloseIFF(iffh);
                         }
-                        FreeIFF(iffh);
-                        iffh = NULL;
+                        CloseIFF(iffh);
                     }
+                    FreeIFF(iffh);
+                    iffh = NULL;
                 }
                 
                 /* Tell clipboard we are done reading */
@@ -1141,27 +1172,16 @@ LONG ListClipboards(VOID)
         /* Display information if unit has content */
         if (hasContent) {
             UBYTE typeStr[5];
-            ULONG mappedUnit;
             typeStr[0] = (UBYTE)((formType >> 24) & 0xFF);
             typeStr[1] = (UBYTE)((formType >> 16) & 0xFF);
             typeStr[2] = (UBYTE)((formType >> 8) & 0xFF);
             typeStr[3] = (UBYTE)(formType & 0xFF);
-            typeStr[4] = '\0';
+            typeStr[4] = '\0';        
             
-            /* Calculate what unit this FORM type would map to */
-            mappedUnit = FormIDToUnit(formType);
-            
-            Printf("%4lu  %-4s   %6lu", unit, typeStr, formSize);
-            
-            /* Show mapped unit if different from actual unit */
-            if (mappedUnit != unit) {
-                Printf("  (maps to %lu)", mappedUnit);
-            } else {
-                Printf("  [mapped]");
-            }
+            Printf("%4lu  %-4s   %6lu ", unit, typeStr, formSize);
             
             if (textPreview && textLen > 0) {
-                Printf("   %.40s", textPreview);
+                Printf("   %.30s", textPreview);
             }
             
             Printf("\n");
@@ -1183,7 +1203,7 @@ LONG ListClipboards(VOID)
     }
     
     if (unitsWithContent == 0) {
-        Printf("No clipboard units contain data.\n");
+        Printf("Clipboard is empty.\n");
     } else {
         Printf("\nTotal: %lu clipboard unit(s) in use.\n", unitsWithContent);
     }
