@@ -58,10 +58,12 @@ LONG CopyTextToClipboard(STRPTR fileName, ULONG unit, STRPTR textBuffer, ULONG t
 LONG PasteFromClipboard(STRPTR fileName, ULONG unit, BOOL forceOverwrite);
 LONG ListClipboards(VOID);
 ULONG FormIDToUnit(ULONG formID);
+ULONG StringToFormID(STRPTR formStr);
+ULONG DetectFormTypeFromFile(STRPTR fileName);
 LONG FlushClipboard(ULONG unit);
 VOID CBReadDone(struct IOClipReq *ioreq);
 
-static const char *verstag = "$VER: Clipboard 1.2 (2/1/2026)\n";
+static const char *verstag = "$VER: Clipboard 47.2 (2/1/2026)\n";
 static const char *stack_cookie = "$STACK: 4096\n";
 const long oslibversion = 45L;
 
@@ -75,7 +77,7 @@ int main(int argc, char *argv[])
     BOOL listMode = FALSE;
     BOOL flushMode = FALSE;
     BOOL forceOverwrite = FALSE;
-    LONG args[6];
+    LONG args[7];
     LONG result = RETURN_FAIL;
     
     /* Check if running from CLI */
@@ -86,7 +88,9 @@ int main(int argc, char *argv[])
     
     /* Initialize libraries */
     if (!InitializeLibraries()) {
-        LONG errorCode = IoErr();
+        LONG errorCode;  /* C89: declare at start of block */
+        
+        errorCode = IoErr();
         if (errorCode == 0) {
             errorCode = ERROR_INVALID_RESIDENT_LIBRARY;
         }
@@ -95,12 +99,11 @@ int main(int argc, char *argv[])
     }
     
     /* Parse command line arguments */
-    /* Template: COPY/K,PASTE/K,CLIPUNIT/K/N,LIST/S,FLUSH/S,FORCE/S */
+    /* Template: COPY/K,PASTE/K,CLIPUNIT/K/N,FORMUNIT/K,LIST/S,FLUSH/S,FORCE/S */
     memset(args, 0, sizeof(args));
     
-    rda = ReadArgs("FROM=COPY/K,TO=PASTE/K,CLIPUNIT/K/N,LIST/S,FLUSH/S,FORCE/S", args, NULL);
+    rda = ReadArgs("FROM=COPY/K,TO=PASTE/K,CLIPUNIT/K/N,FORMUNIT/K,LIST/S,FLUSH/S,FORCE/S", args, NULL);
     if (!rda) {
-        LONG errorCode = IoErr();
         ShowUsage();
         Cleanup();
         return RETURN_FAIL;
@@ -110,9 +113,64 @@ int main(int argc, char *argv[])
     if (args[0]) copyFile = (STRPTR)args[0];
     if (args[1]) pasteFile = (STRPTR)args[1];
     if (args[2]) unit = *((ULONG *)args[2]);
-    if (args[3]) listMode = TRUE;
-    if (args[4]) flushMode = TRUE;
-    if (args[5]) forceOverwrite = TRUE;
+    if (args[3]) {
+        STRPTR formUnitStr = (STRPTR)args[3];
+        
+        /* Check if both CLIPUNIT and FORMUNIT are specified */
+        if (args[2]) {
+            Printf("Clipboard: Cannot specify both CLIPUNIT and FORMUNIT. Use only one.\n");
+            FreeArgs(rda);
+            Cleanup();
+            return RETURN_FAIL;
+        }
+        
+        /* Check if FORMUNIT is the special "FORM" type (case-insensitive) */
+        {
+            BOOL isForm = FALSE;
+            if (strlen(formUnitStr) == 4 &&
+                (formUnitStr[0] == 'F' || formUnitStr[0] == 'f') &&
+                (formUnitStr[1] == 'O' || formUnitStr[1] == 'o') &&
+                (formUnitStr[2] == 'R' || formUnitStr[2] == 'r') &&
+                (formUnitStr[3] == 'M' || formUnitStr[3] == 'm')) {
+                isForm = TRUE;
+            }
+            
+            if (isForm) {
+                ULONG detectedFormID;  /* C89: declare at start of block */
+                
+                /* Need to detect FORM type from source file */
+                if (!copyFile) {
+                    Printf("Clipboard: FORMUNIT=FORM requires COPY=<file> to detect FORM type.\n");
+                    FreeArgs(rda);
+                    Cleanup();
+                    return RETURN_FAIL;
+                }
+                
+                detectedFormID = DetectFormTypeFromFile(copyFile);
+                if (detectedFormID == 0) {
+                    Printf("Clipboard: Could not detect FORM type from file '%s'.\n", copyFile);
+                    FreeArgs(rda);
+                    Cleanup();
+                    return RETURN_FAIL;
+                }
+                unit = FormIDToUnit(detectedFormID);
+            } else {
+                ULONG formID;  /* C89: declare at start of block */
+                
+                formID = StringToFormID(formUnitStr);
+                if (formID == 0) {
+                    Printf("Clipboard: Invalid FORM type '%s'. Must be 3-4 characters.\n", formUnitStr);
+                    FreeArgs(rda);
+                    Cleanup();
+                    return RETURN_FAIL;
+                }
+                unit = FormIDToUnit(formID);
+            }
+        }
+    }
+    if (args[4]) listMode = TRUE;
+    if (args[5]) flushMode = TRUE;
+    if (args[6]) forceOverwrite = TRUE;
     
     /* Validate unit number */
     if (unit > 255) {
@@ -248,18 +306,19 @@ VOID Cleanup(VOID)
 VOID ShowUsage(VOID)
 {
     Printf("Clipboard - Universal clipboard and file converter\n");
-    Printf("Usage: Clipboard COPY=<file> [PASTE=<file>] [CLIPUNIT=<n>]\n");
-    Printf("       Clipboard PASTE=<file> [CLIPUNIT=<n>]\n");
+    Printf("Usage: Clipboard COPY=<file> [PASTE=<file>] [CLIPUNIT=<n>|FORMUNIT=<type>]\n");
+    Printf("       Clipboard PASTE=<file> [CLIPUNIT=<n>|FORMUNIT=<type>]\n");
     Printf("       Clipboard LIST\n");
-    Printf("       Clipboard FLUSH\n");
+    Printf("       Clipboard FLUSH [CLIPUNIT=<n>|FORMUNIT=<type>]\n");
     Printf("\n");
     Printf("Options:\n");
-    Printf("  COPY=<file>    Copy file to clipboard (converts to IFF via datatypes)\n");
-    Printf("  PASTE=<file>   Paste clipboard to file (extracts text from FTXT)\n");
-    Printf("  CLIPUNIT=<n>   Clipboard unit number (0-255, default 0)\n");
-    Printf("  LIST           List all clipboard units with content (0-255)\n");
-    Printf("  FLUSH          Clear the specified clipboard unit\n");
-    Printf("  FORCE          Overwrite existing files when pasting\n");
+    Printf("  COPY=<file>     Copy file to clipboard (converts to IFF via datatypes)\n");
+    Printf("  PASTE=<file>    Paste clipboard to file (extracts text from FTXT)\n");
+    Printf("  CLIPUNIT=<n>    Clipboard unit number (0-255, default 0)\n");
+    Printf("  FORMUNIT=<type> IFF FORM type (3-4 chars, e.g., FTXT, ILBM) - maps to unit\n");
+    Printf("  LIST            List all clipboard units with content (0-255)\n");
+    Printf("  FLUSH           Clear the specified clipboard unit\n");
+    Printf("  FORCE           Overwrite existing files when pasting\n");
     Printf("\n");
     Printf("Note: COPY and PASTE can be used together. COPY is always performed first, then PASTE. This can be used to convert files to IFF format.\n");
     Printf("\n");
@@ -268,9 +327,11 @@ VOID ShowUsage(VOID)
     Printf("  Clipboard PASTE=output.txt        # Paste clipboard to file\n");
     Printf("  Clipboard COPY=file.txt PASTE=out.txt  # Copy then paste\n");
     Printf("  Clipboard COPY=file.txt CLIPUNIT=1    # Copy to clipboard unit 1\n");
+    Printf("  Clipboard COPY=image.jpg FORMUNIT=ILBM # Copy to unit mapped for ILBM\n");
     Printf("  Clipboard LIST                    # List all clipboard units\n");
     Printf("  Clipboard FLUSH                  # Clear clipboard unit 0\n");
     Printf("  Clipboard FLUSH CLIPUNIT=5       # Clear clipboard unit 5\n");
+    Printf("  Clipboard FLUSH FORMUNIT=FTXT    # Clear unit mapped for FTXT\n");
 }
 
 /* Check if datatype object supports DTM_COPY method */
@@ -993,6 +1054,110 @@ LONG PasteFromClipboard(STRPTR fileName, ULONG unit, BOOL forceOverwrite)
     }
     
     return result;
+}
+
+/* Convert string to FORM ID (ULONG) */
+/* Accepts 3 or 4 character strings, pads 3-char strings with space */
+/* Returns 0 if invalid (empty, too long, or contains invalid characters) */
+ULONG StringToFormID(STRPTR formStr)
+{
+    ULONG formID = 0;
+    ULONG len;
+    UBYTE c0, c1, c2, c3;
+    
+    if (!formStr || !*formStr) {
+        return 0;
+    }
+    
+    len = strlen(formStr);
+    
+    /* Must be 3 or 4 characters */
+    if (len < 3 || len > 4) {
+        return 0;
+    }
+    
+    /* Extract characters, convert to uppercase, pad with space if needed */
+    c0 = (UBYTE)(formStr[0] >= 'a' && formStr[0] <= 'z' ? formStr[0] - 32 : formStr[0]);
+    c1 = (UBYTE)(formStr[1] >= 'a' && formStr[1] <= 'z' ? formStr[1] - 32 : formStr[1]);
+    c2 = (UBYTE)(formStr[2] >= 'a' && formStr[2] <= 'z' ? formStr[2] - 32 : formStr[2]);
+    
+    if (len == 3) {
+        /* Pad with space */
+        c3 = ' ';
+    } else {
+        c3 = (UBYTE)(formStr[3] >= 'a' && formStr[3] <= 'z' ? formStr[3] - 32 : formStr[3]);
+    }
+    
+    /* Validate characters are printable ASCII (32-126) */
+    if (c0 < 32 || c0 > 126 || c1 < 32 || c1 > 126 || 
+        c2 < 32 || c2 > 126 || c3 < 32 || c3 > 126) {
+        return 0;
+    }
+    
+    /* Create FORM ID using MAKE_ID */
+    formID = MAKE_ID(c0, c1, c2, c3);
+    
+    return formID;
+}
+
+/* Detect FORM type from a source file by creating a datatype and saving to temp IFF */
+/* Returns the FORM ID (ULONG) or 0 if detection fails */
+ULONG DetectFormTypeFromFile(STRPTR fileName)
+{
+    Object *dtObject = NULL;
+    UBYTE tempFileName[31];
+    STRPTR tempFile;
+    BPTR tempFileHandle;
+    ULONG formID = 0;
+    ULONG uniqueID;
+    
+    if (!fileName || *fileName == '\0') {
+        return 0;
+    }
+    
+    /* Create datatype object from file */
+    dtObject = NewDTObject((APTR)fileName, TAG_END);
+    if (!dtObject) {
+        return 0;
+    }
+    
+    /* Generate unique temporary filename */
+    uniqueID = GetUniqueID();
+    SNPrintf(tempFileName, sizeof(tempFileName), "T:clip%08lX", uniqueID);
+    tempFile = tempFileName;
+    
+    /* Save datatype to temporary IFF file */
+    if (!SaveDTObjectA(dtObject, NULL, NULL, tempFile, DTWM_IFF, FALSE, TAG_END)) {
+        DisposeDTObject(dtObject);
+        return 0;
+    }
+    DisposeDTObject(dtObject);
+    dtObject = NULL;
+    
+    /* Open temp file and read FORM type from IFF header */
+    tempFileHandle = Open(tempFile, MODE_OLDFILE);
+    if (tempFileHandle) {
+        ULONG formHeader[3];  /* FORM, size, type */
+        LONG bytesRead;
+        
+        /* Read first 12 bytes: FORM (4) + size (4) + type (4) */
+        bytesRead = Read(tempFileHandle, formHeader, 12);
+        
+        if (bytesRead == 12) {
+            /* Check if it starts with "FORM" */
+            if (formHeader[0] == ID_FORM) {
+                /* Extract FORM type (bytes 8-11) */
+                formID = formHeader[2];
+            }
+        }
+        
+        Close(tempFileHandle);
+    }
+    
+    /* Clean up temp file */
+    DeleteFile(tempFile);
+    
+    return formID;
 }
 
 /* Map FORM ID to clipboard unit number using hash algorithm */

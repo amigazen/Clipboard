@@ -1,0 +1,232 @@
+  Short:        Clipboard management command and file converter
+  Uploader:     toolkit@amigazen.com
+  Author:       amigazen project
+  Type:         util/clipboard
+  Version:      47.2
+  Architecture: m68k-amigaos >= 3.2
+  Distribution: Aminet
+  Kurz:         Universelles Clipboard-Tool mit Dateikonvertierung und Multi-Unit-Unterstützung
+
+  Clipboard is a comprehensive command-line tool for Amiga that provides
+  universal clipboard operations, allowing you to copy files to the clipboard
+  and paste clipboard contents to files. It uses datatypes.library to
+  automatically convert files to IFF format when copying, and extracts text
+  from FTXT clipboard data when pasting. The tool supports multiple clipboard
+  units (0-255) with intelligent FORM ID to unit mapping.
+
+  Features:
+  - Copy files to clipboard with automatic IFF conversion via datatypes.library
+  - Paste clipboard contents to files (extracts text from FTXT data)
+  - Enumerate all clipboard units (0-255) and display content information
+  - Clear specific clipboard units
+  - Support for 256 clipboard units with deterministic FORM ID mapping
+  - Text preview from CHRS, NAME, and TEXT chunks in any IFF type
+  - Automatic file format detection and conversion
+  - Command-line interface suitable for scripts and automation
+
+  Requirements:
+  - AmigaOS 3.2 or higher
+
+  Usage:
+  
+  Copy file to clipboard:
+    Clipboard COPY=<file> [CLIPUNIT=<n>|FORMUNIT=<type>]
+  
+  Copy a file to the clipboard. The file is automatically converted to IFF
+  format using datatypes.library. If CLIPUNIT is not specified, uses unit 0
+  (the default working copy clipboard). FORMUNIT allows you to specify an IFF
+  FORM type (e.g., ILBM, FTXT) and the unit is automatically calculated using
+  the hash algorithm. Use FORMUNIT=FORM to automatically detect the FORM type
+  from the source file.
+
+  Paste clipboard to file:
+    Clipboard PASTE=<file> [CLIPUNIT=<n>|FORMUNIT=<type>] [FORCE]
+  
+  Paste clipboard contents to a file. Text is extracted from FTXT clipboard
+  data. If the file already exists, use FORCE to overwrite. If CLIPUNIT is
+  not specified, reads from unit 0. FORMUNIT allows you to specify an IFF
+  FORM type and the unit is automatically calculated.
+
+  Copy and paste in one command:
+    Clipboard COPY=<file> PASTE=<file> [CLIPUNIT=<n>|FORMUNIT=<type>] [FORCE]
+  
+  Copy a file to clipboard, then immediately paste it to another file. This
+  can be used to convert files to IFF format. COPY is always performed first,
+  then PASTE.
+
+  List all clipboard units:
+    Clipboard LIST
+  
+  Enumerate all clipboard units from 0 to 255 and display information about
+  units that contain data. For each unit with content, shows:
+  - Unit number
+  - IFF FORM type (e.g., FTXT, ILBM, ANIM)
+  - Size in bytes
+  - Text preview (from CHRS, NAME, or TEXT chunks, if available, truncated
+    to 30 characters with ellipsis)
+
+  Clear clipboard unit:
+    Clipboard FLUSH [CLIPUNIT=<n>|FORMUNIT=<type>]
+  
+  Clear the contents of the specified clipboard unit. If CLIPUNIT is not
+  specified, clears unit 0. FORMUNIT allows you to specify an IFF FORM type
+  and the unit is automatically calculated.
+
+  Examples:
+  - Copy an image to clipboard:
+    Clipboard COPY=image.jpg
+    → Copies image.jpg to clipboard unit 0, converting to IFF format
+
+  - Paste clipboard to text file:
+    Clipboard PASTE=output.txt
+    → Extracts text from clipboard unit 0 and writes to output.txt
+
+  - Copy and convert file:
+    Clipboard COPY=file.txt PASTE=out.iff
+    → Copies file.txt to clipboard, then pastes to out.iff (converts to IFF)
+
+  - Copy to specific clipboard unit:
+    Clipboard COPY=document.txt CLIPUNIT=1
+    → Copies document.txt to clipboard unit 1
+
+  - Copy using FORM type mapping:
+    Clipboard COPY=image.jpg FORMUNIT=ILBM
+    → Copies image.jpg to the clipboard unit mapped for ILBM FORM type
+
+  - Copy with automatic FORM type detection:
+    Clipboard COPY=image.jpg FORMUNIT=FORM
+    → Detects that image.jpg becomes ILBM, uses unit mapped for ILBM
+
+  - Clear unit by FORM type:
+    Clipboard FLUSH FORMUNIT=FTXT
+    → Clears the clipboard unit mapped for FTXT FORM type
+
+  - List all clipboard units with content:
+    Clipboard LIST
+    → Displays all clipboard units (0-255) that contain data
+
+  - Clear a clipboard unit:
+    Clipboard FLUSH CLIPUNIT=5
+    → Clears clipboard unit 5
+
+  - Overwrite existing file when pasting:
+    Clipboard PASTE=output.txt FORCE
+    → Pastes clipboard to output.txt, overwriting if it exists
+
+  How It Works:
+  Clipboard uses the standard AmigaOS clipboard.device for all operations.
+  The clipboard device supports 256 units (0-255), where unit 0 is the
+  default working copy clipboard used by most applications.
+
+  Copy Operation:
+  When copying a file, Clipboard uses datatypes.library to:
+  1. Create a datatype object from the source file
+  2. Use the DTM_COPY method to copy the object to the clipboard
+  3. The datatype automatically converts the file to IFF format
+  4. The clipboard device stores the IFF data in the specified unit
+
+  Paste Operation:
+  When pasting, Clipboard:
+  1. Opens the clipboard device and reads IFF data
+  2. Uses iffparse.library to parse the clipboard contents
+  3. Extracts text from FTXT chunks (specifically CHRS chunks)
+  4. Writes the extracted text to the target file
+
+  Clipboard Unit Mapping:
+  Clipboard units 1-255 can be used to store different types of data based
+  on IFF FORM type. The tool includes a deterministic hash function that
+  maps 4-byte IFF FORM IDs to unit numbers (1-255), ensuring that the same
+  FORM type always maps to the same unit. Unit 0 is reserved for the working
+  copy clipboard.
+
+  FORM ID to Clipboard Unit Hashing Algorithm:
+  The mapping uses a two-stage hash algorithm designed for optimal distribution
+  of FORM types across the 255 available units (1-255). The algorithm ensures
+  that identical FORM IDs always map to the same unit number, providing
+  predictable storage locations for different data types.
+
+  Algorithm:
+  1. Extract the four bytes from the 32-bit FORM ID:
+     byte0 = (formID >> 24) & 0xFF  (most significant byte)
+     byte1 = (formID >> 16) & 0xFF
+     byte2 = (formID >> 8) & 0xFF
+     byte3 = formID & 0xFF         (least significant byte)
+
+  2. First stage: Combine bytes using XOR with bit shifts:
+     hash = byte0 ^ (byte1 << 8) ^ (byte2 << 16) ^ (byte3 << 24)
+     This creates an initial hash value that incorporates all four bytes
+     with their positional information preserved.
+
+  3. Second stage: Multiply by prime number and mix high bits back:
+     hash = (hash * 209UL) ^ (hash >> 16)
+     The multiplication by 209 (a prime number) helps distribute values
+     more evenly, while XORing with the high bits (hash >> 16) adds
+     additional mixing to reduce collisions.
+
+  4. Map to unit range:
+     unit = (hash % 255) + 1
+     The modulo operation maps the hash to the range 1-255, reserving
+     unit 0 for the working copy clipboard.
+
+  Example:
+  For FORM ID "FTXT" (0x46545854):
+  - byte0 = 0x46 ('F'), byte1 = 0x54 ('T'), byte2 = 0x58 ('X'), byte3 = 0x54 ('T')
+  - First stage: hash = 0x46 ^ (0x54 << 8) ^ (0x58 << 16) ^ (0x54 << 24)
+  - Second stage: hash = (hash * 209) ^ (hash >> 16)
+  - Final unit: (hash % 255) + 1
+
+  This algorithm provides:
+  - Deterministic mapping: Same FORM ID always maps to same unit
+  - Good distribution: Different FORM types spread across available units
+  - Low collision rate: Prime multiplier and bit mixing reduce hash collisions
+  - Fast computation: Efficient bit operations suitable for real-time use
+
+  LIST Command:
+  The LIST command uses direct clipboard device I/O to efficiently detect
+  content in each unit. It reads the first 12 bytes (IFF FORM header) to
+  determine if a unit contains data, then uses iffparse.library to extract
+  detailed information. For text preview, it searches for CHRS, NAME, or
+  TEXT chunks within any IFF FORM type, not just FTXT.
+
+  IFF Format:
+  All clipboard data is stored in IFF (Interchange File Format). Common
+  FORM types include:
+  - FTXT: Formatted text (used for text clipboard operations)
+  - ILBM: Interleaved bitmap (used for images)
+  - ANIM: Animation (used for animated images)
+  - 8SVX: 8-bit sampled voice (used for audio)
+  - And many other standard and custom FORM types
+
+  For more information, and to report issues, visit:
+  - GitHub: https://github.com/amigazen/Clipboard/
+  - Web: http://www.amigazen.com/toolkit/
+
+  This software is Free and Open Source Software distributed on BSD-2 license terms:
+
+  Copyright (c) 2026 amigazen project
+  All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
+
+  1. Redistributions of source code must retain the above copyright notice,
+     this list of conditions and the following disclaimer.
+
+  2. Redistributions in binary form must reproduce the above copyright notice,
+     this list of conditions and the following disclaimer in the documentation
+     and/or other materials provided with the distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+  ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+  LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+  CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+  SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+  INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+  CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+  ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+  POSSIBILITY OF SUCH DAMAGE.
+
+  amigazen project philosophy is based on openness:
+  Open to anyone and everyone - Open source and free for all - Open your mind and create!
